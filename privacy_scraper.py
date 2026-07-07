@@ -11,7 +11,6 @@ import threading
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
-from bs4 import BeautifulSoup
 from tqdm import tqdm
 from curl_cffi import requests as cffi_requests
 
@@ -217,25 +216,46 @@ class PrivacyScraper:
     def _apply_tokens(self, token_v1, token_v2):
         self.token_v1 = token_v1
         self.token_v2 = token_v2
+        if "__cf_bm" not in self.session.cookies.get_dict():
+            self.session.get("https://privacy.com.br/", impersonate="chrome120")
         response = self.session.get(
             f"https://privacy.com.br/strangler/Authorize?TokenV1={token_v1}&TokenV2={token_v2}",
-            headers={"Host": "privacy.com.br", "Referer": "https://privacy.com.br/auth?route=sign-in"},
+            headers={
+                "Host": "privacy.com.br",
+                "Referer": "https://privacy.com.br/auth?route=sign-in",
+                "Accept": "application/json, text/plain, */*",
+                "Sec-Fetch-Site": "same-origin",
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Dest": "empty",
+            },
             impersonate="chrome120"
         )
         return response.status_code == 200
 
-    def _do_login_request(self, turnstile_token):
+    def _response_needs_captcha(self, response):
+        try:
+            data = response.json()
+        except Exception:
+            return False
+        blob = json.dumps(data).lower()
+        return "captcha" in blob or "turnstile" in blob
+
+    def _do_login_request(self, turnstile_token=None):
+        payload = {
+            "Email": self.email,
+            "Document": None,
+            "Password": self.password,
+            "Locale": "pt-BR",
+            "CanReceiveEmail": True,
+            "ProfileName": ""
+        }
+        if turnstile_token:
+            payload["TurnstileToken"] = turnstile_token
+            payload["TurnstileMode"] = "invisible"
+
         response = self.session.post(
             "https://service.privacy.com.br/auth/login",
-            json={
-                "Email": self.email,
-                "Document": None,
-                "Password": self.password,
-                "Locale": "pt-BR",
-                "CanReceiveEmail": True,
-                "TurnstileToken": turnstile_token,
-                "TurnstileMode": "invisible"
-            },
+            data=json.dumps(payload),
             headers={
                 'Host': 'service.privacy.com.br',
                 'Accept': 'application/json, text/plain, */*',
@@ -255,6 +275,22 @@ class PrivacyScraper:
                 self.token_expires_at = expires_at
                 self.cache.set_token(self.email, t1, t2, expires_at)
                 return True
+            return False
+
+        if self._response_needs_captcha(response):
+            return "captcha_required"
+        return False
+
+    def _login_with_captcha_fallback(self):
+        result = self._do_login_request()
+        if result is True:
+            return True
+        if result == "captcha_required":
+            tqdm.write("Servidor exigiu captcha, resolvendo...")
+            turnstile_token = self.turnstile.resolve()
+            if not turnstile_token:
+                return False
+            return self._do_login_request(turnstile_token) is True
         return False
 
     def login(self):
@@ -264,11 +300,7 @@ class PrivacyScraper:
                 self.token_expires_at = cached.get("expires_at")
                 return True
 
-        turnstile_token = self.turnstile.resolve()
-        if not turnstile_token:
-            return False
-
-        return self._do_login_request(turnstile_token)
+        return self._login_with_captcha_fallback()
 
     def refresh_token_if_needed(self):
         if not self.token_expires_at:
@@ -281,8 +313,7 @@ class PrivacyScraper:
                 return
             tqdm.write("\nToken próximo de expirar, renovando...")
             self.cache.clear()
-            turnstile_token = self.turnstile.resolve()
-            if turnstile_token and self._do_login_request(turnstile_token):
+            if self._login_with_captcha_fallback():
                 tqdm.write("Token renovado com sucesso!")
             else:
                 tqdm.write(f"{RED}Falha ao renovar token!{RESET}")
@@ -303,26 +334,22 @@ class PrivacyScraper:
             ]
         return []
 
-    def get_total_media_count(self, profile_name):
-        response = self.session.get(f"https://privacy.com.br/profile/{profile_name}", impersonate="chrome120")
-        total_posts = 0
-        total_media = 0
-
-        if response.status_code == 200:
-            tabs_div = BeautifulSoup(response.text, 'html.parser').find('div', {'id': 'profile-tabs'})
-            if tabs_div:
-                posts_tab = tabs_div.find('div', {'data-view': 'posts'})
-                if posts_tab:
-                    m = re.search(r'([\d.,]+)\s+(?:Posts|Postagens)', posts_tab.get_text(strip=True))
-                    if m:
-                        total_posts = int(re.sub(r'[.,]', '', m.group(1)))
-                media_tab = tabs_div.find('div', {'data-view': 'mosaic'})
-                if media_tab:
-                    m = re.search(r'([\d.,]+)\s+(?:Media|Mídias)', media_tab.get_text(strip=True))
-                    if m:
-                        total_media = int(re.sub(r'[.,]', '', m.group(1)))
-
-        return total_media, total_posts
+    def get_profile_posts(self, profile_name, offset=0, limit=20):
+        if not self.token_v2:
+            return None
+        response = self.session.get(
+            f"https://service.privacy.com.br/timelinequeries/profile/{offset}/{limit}/{profile_name}",
+            headers={
+                "authorization": f"Bearer {self.token_v2}",
+                "Host": "service.privacy.com.br",
+                "Accept": "application/json, text/plain, */*",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
+                "Origin": "https://privacy.com.br",
+                "Referer": "https://privacy.com.br/",
+            },
+            impersonate="chrome120"
+        )
+        return response.json() if response.status_code == 200 else None
 
     def get_purchased_media(self, offset=0, limit=20):
         if not self.token_v2:
@@ -743,25 +770,23 @@ class MediaDownloader:
 
         return counters["photos"], counters["videos"]
 
-    def _iter_profile_media(self, profile_name, media_type, total_media):
-        skip = 0
-        while skip < total_media:
+    def _iter_profile_media(self, profile_name, media_type):
+        offset, limit = 0, 20
+        while True:
             self.scraper.refresh_token_if_needed()
-            response = self.scraper.session.get(
-                f"https://privacy.com.br/Profile?handler=PartialPosts"
-                f"&skip={skip}&take=10&nomePerfil={profile_name}&filter=mosaico&_={int(time.time() * 1000)}",
-                impersonate="chrome120"
-            )
-            if response.status_code != 200:
+            media_data = self.scraper.get_profile_posts(profile_name, offset, limit)
+            if not media_data or not media_data.get("items"):
                 break
-            data = response.json()
-            if not data.get("mosaicItems"):
+            for post in media_data["items"]:
+                yield from self._collect_eligible(
+                    post.get("medias", []),
+                    media_type,
+                    post.get("postId"),
+                    post.get("publishedDate") or post.get("postDate"),
+                )
+            if len(media_data["items"]) < limit:
                 break
-            for item in data.get("mosaicItems", []):
-                post_id = item.get("postId")
-                post_date = item.get("postDate") or item.get("publishedDate")
-                yield from self._collect_eligible(item.get("files", []), media_type, post_id, post_date)
-            skip += 10
+            offset += limit
 
     def _iter_purchased_media(self, profile_name, media_type):
         offset, limit = 0, 20
@@ -805,11 +830,8 @@ class MediaDownloader:
             offset += limit
 
     def download_profile_media(self, profile_name, media_type="3", pbar=None):
-        total_media, _ = self.scraper.get_total_media_count(profile_name)
-        if total_media == 0:
-            return 0, 0
         return self._drain(
-            self._iter_profile_media(profile_name, media_type, total_media),
+            self._iter_profile_media(profile_name, media_type),
             profile_name, media_type, pbar, "Descobrindo mídias do perfil"
         )
 
@@ -832,13 +854,10 @@ class MediaDownloader:
         os.makedirs(fotos_dir, exist_ok=True)
         os.makedirs(videos_dir, exist_ok=True)
 
-        total_media, _ = self.scraper.get_total_media_count(profile_name)
-        items = []
-        if total_media > 0:
-            items += self._discover(
-                self._iter_profile_media(profile_name, media_type, total_media),
-                "Descobrindo mídias do perfil",
-            )
+        items = self._discover(
+            self._iter_profile_media(profile_name, media_type),
+            "Descobrindo mídias do perfil",
+        )
         items += self._discover(
             self._iter_purchased_media(profile_name, media_type),
             "Descobrindo mídias compradas",
